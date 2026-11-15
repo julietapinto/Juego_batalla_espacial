@@ -1,0 +1,770 @@
+.syntax unified
+.cpu cortex-m3
+.thumb
+.equ PMC,0x400e0600
+.equ PIOA,0x400e0e00
+.equ PIOB,0x400e1000
+.equ PIOC,0x400e1200
+.equ ADC,0x400c0000
+.equ TWI,0x40090000
+.equ TC,0x40080000
+.equ OLED_ADDR,0x3c
+.macro WRITE addr,val
+ ldr r0,=\addr
+ ldr r1,=\val
+ str r1,[r0]
+.endm
+.section .vectors,"a",%progbits
+.global vectors
+vectors:
+.word _stack,Reset_Handler
+.rept 14
+.word Default_Handler
+.endr
+.rept 27
+.word Default_Handler
+.endr
+.word TC0_Handler
+.rept 17
+.word Default_Handler
+.endr
+.section .text
+.thumb_func
+.global Reset_Handler
+Reset_Handler:
+ cpsid i
+ WRITE 0xe000ed08,vectors
+ ldr r0,=_sbss
+ ldr r1,=_ebss
+ movs r2,#0
+1: cmp r0,r1
+ itt lo
+ strlo r2,[r0],#4
+ blo 1b
+ WRITE 0x400e1a54,0x8000 // watchdog disable
+ // Five flash wait states before raising master clock.
+ WRITE 0x400e0a00,0x500
+ WRITE 0x400e0c00,0x500
+ WRITE PMC+0x20,0x00370809
+ ldr r0,=PMC
+1: ldr r1,[r0,#0x68]
+ tst r1,#1
+ beq 1b
+ WRITE PMC+0x20,0x01370809
+ ldr r0,=PMC
+1: ldr r1,[r0,#0x68]
+ tst r1,#0x10000
+ beq 1b
+ WRITE PMC+0x28,0x200d3f01 // 12 MHz *14 =168 MHz
+ ldr r0,=PMC
+1: ldr r1,[r0,#0x68]
+ tst r1,#2
+ beq 1b
+ WRITE PMC+0x30,0x11 // MAIN /2, then PLLA /2
+ bl mck_wait
+ WRITE PMC+0x30,0x12
+ bl mck_wait
+ WRITE PMC+0x10,0x08803800 // PIO A/B/C, TWI1, TC0
+ WRITE PMC+0x100,0x20 // ADC ID37
+ WRITE PIOB,0x08000000
+ WRITE PIOB+0x10,0x08000000
+ WRITE PIOB+0x34,0x08000000
+ WRITE PIOA,0x00800000
+ WRITE PIOA+0x14,0x00800000
+ WRITE PIOA+0x64,0x00800000
+ WRITE PIOC,0x00800000
+ WRITE PIOC+0x14,0x00800000
+ WRITE PIOC+0x64,0x00800000
+ WRITE PIOA+0x04,0x01010000 // analog A0/A1
+ WRITE PIOA+0x60,0x01010000
+ // Peripheral A on PB12/PB13.
+ ldr r0,=PIOB
+ ldr r1,[r0,#0x70]
+ bic r1,r1,#0x3000
+ str r1,[r0,#0x70]
+ WRITE PIOB+4,0x3000
+ WRITE ADC,1
+ WRITE ADC+4,0x13380100 // ADC 21 MHz, startup 512 clocks, tracking 4
+ WRITE ADC+0x10,0xc0
+ WRITE TWI,0x80
+ WRITE TWI,0x24
+ WRITE TWI+0x10,0x6565 // 84MHz/(2*(101+4)) =400 kHz
+ ldr r0,=page_cmd
+ movs r1,#2
+ strb r1,[r0,#1]
+ movs r1,#0x10
+ strb r1,[r0,#2]
+ bl oled_init
+ WRITE TC+4,0x0000c000 // TIMER_CLOCK1 MCK/2, waveform UP_RC
+ WRITE TC+0x1c,1400000 // 42 MHz / 30
+ WRITE TC+0x24,0x10
+ WRITE 0xe000e280,0x08000000
+ WRITE 0xe000e100,0x08000000
+ WRITE TC,5
+ cpsie i
+main:
+ // Atomic check plus WFI prevents a lost wakeup.
+ cpsid i
+ ldr r0,=ticks
+ ldr r1,[r0]
+ ldr r2,=consumed
+ ldr r3,[r2]
+ cmp r1,r3
+ bne 2f
+ dsb
+ wfi
+ cpsie i
+ b main
+2: str r1,[r2]
+ cpsie i
+ bl input
+ bl update
+ bl render
+ bl oled_flush
+ b main
+.thumb_func
+mck_wait:
+ ldr r0,=PMC
+1: ldr r1,[r0,#0x68]
+ tst r1,#8
+ beq 1b
+ bx lr
+.thumb_func
+Default_Handler: b .
+.thumb_func
+TC0_Handler:
+ ldr r0,=TC
+ ldr r1,[r0,#0x20]
+ ldr r0,=ticks
+ ldr r1,[r0]
+ adds r1,#1
+ str r1,[r0]
+ // LED L: PB27, cambiar cada 16 ticks.
+ tst r1,#15
+ bne irq_done
+ ldr r0,=PIOB
+ ldr r2,[r0,#0x38]
+ tst r2,#0x08000000
+ ldr r2,=0x08000000
+ ite eq
+ streq r2,[r0,#0x30]
+ strne r2,[r0,#0x34]
+irq_done:
+ bx lr
+.ltorg
+// I2C writes, bounded waits. A failed OLED stays recoverable.
+// r0 mask; returns r0=0 success,1 error.
+.thumb_func
+wait_twi:
+ ldr r1,=TWI
+ ldr r2,=100000
+1: ldr r3,[r1,#0x20]
+ tst r3,#0x100
+ bne 3f
+ tst r3,r0
+ bne 2f
+ subs r2,#1
+ bne 1b
+3: movs r0,#1
+ bx lr
+2: movs r0,#0
+ bx lr
+// r0 buffer, r1 length, r2 control byte. Returns success/error.
+.thumb_func
+twi_send:
+ push {r4-r8,lr}
+ mov r4,r0
+ mov r5,r1
+ mov r6,r2
+ ldr r7,=TWI
+ ldr r0,=(OLED_ADDR<<16)
+ str r0,[r7,#4]
+ str r6,[r7,#0x34]
+1: movs r0,#4
+ bl wait_twi
+ cmp r0,#0
+ bne 3f
+ cmp r5,#0
+ beq 2f
+ ldrb r0,[r4],#1
+ str r0,[r7,#0x34]
+ subs r5,#1
+ b 1b
+2: movs r0,#2
+ str r0,[r7]
+ movs r0,#1
+ bl wait_twi
+ cmp r0,#0
+ bne 3f
+ pop {r4-r8,pc}
+3: ldr r1,=i2c_errors
+ ldr r2,[r1]
+ adds r2,#1
+ str r2,[r1]
+ movs r0,#0x80
+ str r0,[r7]
+ movs r0,#0x24
+ str r0,[r7]
+ ldr r0,=0x6565
+ str r0,[r7,#0x10]
+ movs r0,#1
+ pop {r4-r8,pc}
+.thumb_func
+oled_init:
+ push {r4,lr}
+ ldr r4,=2000000
+1: subs r4,#1
+ bne 1b
+ ldr r0,=init_cmd
+ movs r1,#25
+ movs r2,#0
+ bl twi_send
+ pop {r4,pc}
+.thumb_func
+oled_flush:
+ push {r4-r6,lr}
+ movs r4,#0
+ ldr r5,=framebuffer
+1: ldr r0,=page_cmd
+ orr r1,r4,#0xb0
+ strb r1,[r0]
+ movs r1,#3
+ movs r2,#0
+ bl twi_send
+ cmp r0,#0
+ bne 2f
+ mov r0,r5
+ movs r1,#128
+ movs r2,#0x40
+ bl twi_send
+ cmp r0,#0
+ bne 2f
+ adds r5,#128
+ adds r4,#1
+ cmp r4,#8
+ bne 1b
+2: pop {r4-r6,pc}
+.ltorg
+.thumb_func
+input:
+ push {r4,lr}
+ ldr r4,=ADC
+ movs r0,#2
+ str r0,[r4]
+ ldr r2,=100000
+1: ldr r0,[r4,#0x30]
+ and r0,r0,#0xc0
+ cmp r0,#0xc0
+ beq 2f
+ subs r2,#1
+ bne 1b
+ b 3f
+2: ldr r0,[r4,#0x6c] // CDR7 X
+ ldr r1,=ax
+ str r0,[r1]
+ ldr r0,[r4,#0x68] // CDR6 Y
+ str r0,[r1,#4]
+3: ldr r0,=PIOA
+ ldr r0,[r0,#0x3c]
+ tst r0,#0x800000
+ ite eq
+ moveq r0,#1
+ movne r0,#0
+ ldr r1,=PIOC
+ ldr r1,[r1,#0x3c]
+ tst r1,#0x800000
+ it eq
+ orreq r0,r0,#2
+ // Two consecutive equal samples debounce both buttons.
+ ldr r1,=raw_buttons
+ ldr r2,[r1]
+ str r0,[r1]
+ cmp r0,r2
+ bne 4f
+ ldr r1,=buttons
+ ldr r2,[r1]
+ str r0,[r1]
+ bic r0,r0,r2
+ ldr r1,=pressed
+ str r0,[r1]
+ pop {r4,pc}
+4: movs r0,#0
+ ldr r1,=pressed
+ str r0,[r1]
+ pop {r4,pc}
+.thumb_func
+new_game:
+ ldr r0,=game
+ movs r1,#1
+ str r1,[r0] // state
+ movs r1,#60
+ str r1,[r0,#4]
+ movs r1,#52
+ str r1,[r0,#8]
+ movs r1,#0
+ str r1,[r0,#12] // score
+ str r1,[r0,#20] // bullet active
+ str r1,[r0,#32] // frame
+ movs r1,#3
+ str r1,[r0,#16] // lives
+ ldr r0,=enemies
+ movs r1,#0
+1: lsls r2,r1,#4
+ adds r2,#12
+ str r2,[r0],#4
+ movs r2,#12
+ str r2,[r0],#4
+ adds r1,#1
+ cmp r1,#5
+ bne 1b
+ bx lr
+.thumb_func
+update:
+ push {r4-r8,lr}
+ ldr r4,=game
+ ldr r0,[r4]
+ cmp r0,#1
+ beq 1f
+ ldr r0,=pressed
+ ldr r0,[r0]
+ cmp r0,#0
+ beq 9f
+ bl new_game
+ b 9f
+1: ldr r0,[r4,#32]
+ adds r0,#1
+ str r0,[r4,#32]
+ // Independent X/Y dead zones. Two pixels/frame.
+ ldr r1,=ax
+ ldr r2,[r1]
+ ldr r0,[r4,#4]
+ bl axis
+ cmp r0,#120
+ it hi
+ movhi r0,#120
+ str r0,[r4,#4]
+ ldr r1,=ay
+ ldr r2,[r1]
+ ldr r0,[r4,#8]
+ bl axis
+ cmp r0,#10
+ it lo
+ movlo r0,#10
+ cmp r0,#56
+ it hi
+ movhi r0,#56
+ str r0,[r4,#8]
+ ldr r0,[r4,#20]
+ cmp r0,#0
+ bne 2f
+ ldr r0,=buttons
+ ldr r0,[r0]
+ tst r0,#2
+ beq 3f
+ movs r0,#1
+ str r0,[r4,#20]
+ ldr r0,[r4,#4]
+ adds r0,#3
+ str r0,[r4,#24]
+ ldr r0,[r4,#8]
+ str r0,[r4,#28]
+2: ldr r0,[r4,#28]
+ subs r0,#4
+ cmp r0,#9
+ bge 21f
+ movs r0,#0
+ str r0,[r4,#20]
+21: str r0,[r4,#28]
+3: ldr r5,=enemies
+ movs r6,#5
+4: ldr r7,[r5] // enemy X
+ ldr r8,[r5,#4] // Y
+ ldr r0,[r4,#32]
+ tst r0,#1
+ it eq
+ addeq r8,#1
+ cmp r8,#57
+ bge 7f
+ ldr r0,[r4,#20]
+ cmp r0,#0
+ beq 5f
+ ldr r0,[r4,#24]
+ subs r0,r0,r7
+ cmp r0,#7
+ bhi 5f
+ ldr r0,[r4,#28]
+ subs r0,r0,r8
+ adds r0,#2
+ cmp r0,#9
+ bhi 5f
+ movs r0,#0
+ str r0,[r4,#20]
+ ldr r0,[r4,#12]
+ adds r0,#10
+ ldr r1,=9999
+ cmp r0,r1
+ it hi
+ movhi r0,#0
+ str r0,[r4,#12]
+ b 8f
+5: // rectangle overlap ship (8x8) and enemy (8x8)
+ ldr r0,[r4,#4]
+ subs r0,r0,r7
+ adds r0,#7
+ cmp r0,#14
+ bhi 6f
+ ldr r0,[r4,#8]
+ subs r0,r0,r8
+ adds r0,#7
+ cmp r0,#14
+ bhi 6f
+7: ldr r0,[r4,#16]
+ cmp r0,#0
+ beq 8f
+ subs r0,#1
+ str r0,[r4,#16]
+ bne 8f
+ movs r0,#2
+ str r0,[r4]
+8: movs r8,#10
+ // Deterministic changing spawn positions, no runtime library.
+ ldr r0,[r4,#32]
+ adds r7,r7,r0
+ adds r7,#29
+ movs r1,#120
+ udiv r2,r7,r1
+ mls r7,r2,r1,r7
+6: str r7,[r5]
+ str r8,[r5,#4]
+ adds r5,#8
+ subs r6,#1
+ bne 4b
+9: pop {r4-r8,pc}
+.thumb_func
+axis:
+ ldr r3,=1400
+ cmp r2,r3
+ bhs 1f
+ subs r0,#2
+ it mi
+ movmi r0,#0
+ bx lr
+1: ldr r3,=2700
+ cmp r2,r3
+ it hi
+ addhi r0,#2
+ bx lr
+.ltorg
+// Pixel OR, clips in both axes. r0=x r1=y.
+.thumb_func
+pixel:
+ cmp r0,#128
+ bhs 1f
+ cmp r1,#64
+ bhs 1f
+ lsrs r2,r1,#3
+ add r0,r0,r2,lsl #7
+ and r1,r1,#7
+ movs r2,#1
+ lsl r2,r2,r1
+ ldr r3,=framebuffer
+ ldrb r1,[r3,r0]
+ orrs r1,r2
+ strb r1,[r3,r0]
+1: bx lr
+// Sprite: r0=x r1=y r2=8 columns, bit0 at top.
+.thumb_func
+sprite:
+ push {r4-r10,lr}
+ mov r4,r0
+ mov r5,r1
+ mov r6,r2
+ movs r7,#0
+1: ldrb r8,[r6,r7]
+ movs r9,#0
+2: tst r8,#1
+ beq 3f
+ add r0,r4,r7
+ add r1,r5,r9
+ bl pixel
+3: lsr r8,r8,#1
+ adds r9,#1
+ cmp r9,#8
+ bne 2b
+ adds r7,#1
+ cmp r7,#8
+ bne 1b
+ pop {r4-r10,pc}
+// Font consists of ASCII space..Z, 5 columns, 7 rows.
+.thumb_func
+text:
+ push {r4-r10,lr}
+ mov r4,r0
+ mov r5,r1
+ mov r6,r2
+1: ldrb r0,[r6],#1
+ cmp r0,#0
+ beq 5f
+ subs r0,#32
+ movs r1,#5
+ mul r0,r0,r1
+ ldr r10,=font
+ add r10,r0
+ movs r7,#0
+2: ldrb r8,[r10,r7]
+ movs r9,#0
+3: tst r8,#1
+ beq 4f
+ add r0,r4,r7
+ add r1,r5,r9
+ bl pixel
+4: lsr r8,r8,#1
+ adds r9,#1
+ cmp r9,#7
+ bne 3b
+ adds r7,#1
+ cmp r7,#5
+ bne 2b
+ adds r4,#6
+ b 1b
+5: pop {r4-r10,pc}
+.thumb_func
+render:
+ push {r4-r8,lr}
+ ldr r0,=framebuffer
+ movs r1,#0
+ movw r2,#256
+1: str r1,[r0],#4
+ subs r2,#1
+ bne 1b
+ ldr r4,=game
+ ldr r0,[r4]
+ cmp r0,#0
+ beq menu
+ cmp r0,#2
+ beq over
+ movs r0,#0
+ movs r1,#0
+ ldr r2,=hud
+ bl text
+ // Four decimal digits, hardware division.
+ ldr r0,[r4,#12]
+ ldr r1,=digits+3
+ movs r2,#10
+ movs r3,#4
+2: udiv r5,r0,r2
+ mls r6,r5,r2,r0
+ adds r6,#48
+ strb r6,[r1],#-1
+ mov r0,r5
+ subs r3,#1
+ bne 2b
+ movs r0,#12
+ movs r1,#0
+ ldr r2,=digits
+ bl text
+ ldr r0,[r4,#16]
+ adds r0,#48
+ ldr r1,=life_digit
+ strb r0,[r1]
+ movs r0,#102
+ movs r1,#0
+ ldr r2,=life_digit
+ bl text
+ ldr r0,[r4,#4]
+ ldr r1,[r4,#8]
+ ldr r2,=ship_sprite
+ bl sprite
+ ldr r0,[r4,#20]
+ cmp r0,#0
+ beq 3f
+ ldr r0,[r4,#24]
+ ldr r1,[r4,#28]
+ bl pixel
+ ldr r0,[r4,#24]
+ ldr r1,[r4,#28]
+ adds r1,#1
+ bl pixel
+3: ldr r5,=enemies
+ movs r6,#5
+4: ldr r0,[r5],#4
+ ldr r1,[r5],#4
+ ldr r2,=enemy_sprite
+ bl sprite
+ subs r6,#1
+ bne 4b
+ pop {r4-r8,pc}
+menu:
+ movs r0,#28
+ movs r1,#16
+ ldr r2,=title
+ bl text
+ movs r0,#10
+ movs r1,#40
+ ldr r2,=start_text
+ bl text
+ movs r0,#46
+ movs r1,#28
+ ldr r2,=diag_title
+ bl text
+ bl diagnostic_line
+ pop {r4-r8,pc}
+over:
+ movs r0,#37
+ movs r1,#16
+ ldr r2,=over_text
+ bl text
+ movs r0,#10
+ movs r1,#40
+ ldr r2,=restart_text
+ bl text
+ pop {r4-r8,pc}
+.ltorg
+// Diagnostico: contador TC0, entradas y error I2C.
+.thumb_func
+diagnostic_line:
+ push {r4-r8,lr}
+ ldr r4,=diag_buffer
+ ldr r0,=diag_template
+ movs r1,#18
+1: ldrb r2,[r0],#1
+ strb r2,[r4],#1
+ subs r1,#1
+ bne 1b
+ ldr r4,=diag_buffer
+ ldr r0,=ticks
+ ldr r0,[r0]
+ movw r1,#1000
+ udiv r2,r0,r1
+ mls r0,r2,r1,r0
+ add r1,r4,#4
+ movs r2,#10
+ movs r3,#3
+2: udiv r5,r0,r2
+ mls r6,r5,r2,r0
+ adds r6,#48
+ strb r6,[r1],#-1
+ mov r0,r5
+ subs r3,#1
+ bne 2b
+ ldr r0,=raw_buttons
+ ldr r0,[r0]
+ and r1,r0,#1
+ adds r1,#48
+ strb r1,[r4,#8]
+ lsr r0,r0,#1
+ and r0,r0,#1
+ adds r0,#48
+ strb r0,[r4,#12]
+ ldr r0,=i2c_errors
+ ldr r0,[r0]
+ cmp r0,#0
+ ite eq
+ moveq r0,#48
+ movne r0,#49
+ strb r0,[r4,#16]
+ movs r0,#0
+ movs r1,#54
+ mov r2,r4
+ bl text
+ pop {r4-r8,pc}
+.ltorg
+.section .rodata
+diag_title: .asciz "DIAG 1"
+diag_template: .asciz "T:000 A:0 D:0 E:0"
+.section .bss
+.balign 4
+diag_buffer: .space 20
+.section .rodata
+init_cmd: .byte 0xae,0xd5,0x80,0xa8,0x3f,0xd3,0,0x40,0xad,0x8b,0xa1,0xc8,0xda,0x12,0x81,0x80,0xd9,0x22,0xdb,0x35,0xa4,0xa6,0xaf,0x00,0x10
+ship_sprite: .byte 0x60,0x30,0x1c,0x7f,0x7f,0x1c,0x30,0x60
+enemy_sprite: .byte 0x18,0x5c,0x36,0x1f,0x1f,0x36,0x5c,0x18
+title: .asciz "SPACE BATTLE"
+start_text: .asciz "A2 O D7: INICIAR"
+restart_text: .asciz "A2 O D7: REINICIO"
+over_text: .asciz "GAME OVER"
+hud: .asciz "P:             V:"
+.section .bss
+.balign 4
+.global framebuffer
+framebuffer: .space 1024
+ticks: .space 4
+consumed: .space 4
+ax: .space 4
+ay: .space 4
+raw_buttons: .space 4
+buttons: .space 4
+pressed: .space 4
+.global game
+game: .space 36
+enemies: .space 40
+.global i2c_errors
+i2c_errors: .space 4
+page_cmd: .space 4
+digits: .space 8
+life_digit: .space 4
+
+
+.section .rodata
+font:
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 32
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 33
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 34
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 35
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 36
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 37
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 38
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 39
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 40
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 41
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 42
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 43
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 44
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 45
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 46
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 47
+ .byte 0x3e,0x51,0x49,0x45,0x3e // ASCII 48
+ .byte 0x00,0x42,0x7f,0x40,0x00 // ASCII 49
+ .byte 0x42,0x61,0x51,0x49,0x46 // ASCII 50
+ .byte 0x21,0x41,0x45,0x4b,0x31 // ASCII 51
+ .byte 0x18,0x14,0x12,0x7f,0x10 // ASCII 52
+ .byte 0x27,0x45,0x45,0x45,0x39 // ASCII 53
+ .byte 0x3c,0x4a,0x49,0x49,0x30 // ASCII 54
+ .byte 0x01,0x71,0x09,0x05,0x03 // ASCII 55
+ .byte 0x36,0x49,0x49,0x49,0x36 // ASCII 56
+ .byte 0x06,0x49,0x49,0x29,0x1e // ASCII 57
+ .byte 0x00,0x36,0x36,0x00,0x00 // ASCII 58
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 59
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 60
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 61
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 62
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 63
+ .byte 0x00,0x00,0x00,0x00,0x00 // ASCII 64
+ .byte 0x7e,0x11,0x11,0x11,0x7e // ASCII 65
+ .byte 0x7f,0x49,0x49,0x49,0x36 // ASCII 66
+ .byte 0x3e,0x41,0x41,0x41,0x22 // ASCII 67
+ .byte 0x7f,0x41,0x41,0x22,0x1c // ASCII 68
+ .byte 0x7f,0x49,0x49,0x49,0x41 // ASCII 69
+ .byte 0x7f,0x09,0x09,0x09,0x01 // ASCII 70
+ .byte 0x3e,0x41,0x49,0x49,0x7a // ASCII 71
+ .byte 0x7f,0x08,0x08,0x08,0x7f // ASCII 72
+ .byte 0x00,0x41,0x7f,0x41,0x00 // ASCII 73
+ .byte 0x20,0x40,0x41,0x3f,0x01 // ASCII 74
+ .byte 0x7f,0x08,0x14,0x22,0x41 // ASCII 75
+ .byte 0x7f,0x40,0x40,0x40,0x40 // ASCII 76
+ .byte 0x7f,0x02,0x0c,0x02,0x7f // ASCII 77
+ .byte 0x7f,0x04,0x08,0x10,0x7f // ASCII 78
+ .byte 0x3e,0x41,0x41,0x41,0x3e // ASCII 79
+ .byte 0x7f,0x09,0x09,0x09,0x06 // ASCII 80
+ .byte 0x3e,0x41,0x51,0x21,0x5e // ASCII 81
+ .byte 0x7f,0x09,0x19,0x29,0x46 // ASCII 82
+ .byte 0x46,0x49,0x49,0x49,0x31 // ASCII 83
+ .byte 0x01,0x01,0x7f,0x01,0x01 // ASCII 84
+ .byte 0x3f,0x40,0x40,0x40,0x3f // ASCII 85
+ .byte 0x1f,0x20,0x40,0x20,0x1f // ASCII 86
+ .byte 0x3f,0x40,0x38,0x40,0x3f // ASCII 87
+ .byte 0x63,0x14,0x08,0x14,0x63 // ASCII 88
+ .byte 0x07,0x08,0x70,0x08,0x07 // ASCII 89
+ .byte 0x61,0x51,0x49,0x45,0x43 // ASCII 90
+
+
